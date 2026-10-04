@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Install RedNext
+GenericName=System Installer
+Comment=Install RedNext Linux to this computer
+Exec=/usr/bin/rednext-installer
+Icon=/etc/calamares/branding/rednext/logo.png
+Terminal=false
+Categories=System;
+Keywords=installer;calamares;system;

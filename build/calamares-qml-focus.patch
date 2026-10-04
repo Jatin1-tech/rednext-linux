@@ -1,0 +1,57 @@
+diff -ru a/src/libcalamaresui/viewpages/QmlViewStep.cpp b/src/libcalamaresui/viewpages/QmlViewStep.cpp
+--- a/src/libcalamaresui/viewpages/QmlViewStep.cpp	2026-10-04 18:56:01.700411203 +0530
++++ b/src/libcalamaresui/viewpages/QmlViewStep.cpp	2026-10-04 18:56:01.718028156 +0530
+@@ -24,7 +24,7 @@
+ #include <QQmlContext>
+ #include <QQmlEngine>
+ #include <QQuickItem>
+-#if QT_VERSION < QT_VERSION_CHECK( 6, 0, 0 )
++#if 1  // RedNext: QQuickWidget on Qt 6 too; the Qt 6 window container never gets keyboard focus
+ #include <QQuickWidget>
+ #else
+ #include <QQuickWindow>
+@@ -74,10 +74,11 @@
+ {
+     Calamares::registerQmlModels();
+ 
+-#if QT_VERSION < QT_VERSION_CHECK( 6, 0, 0 )
++#if 1  // RedNext: QQuickWidget on Qt 6 too; the Qt 6 window container never gets keyboard focus
+     m_qmlWidget = new QQuickWidget;
+     m_qmlWidget->setResizeMode( QQuickWidget::SizeRootObjectToView );
+     m_qmlWidget->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Expanding );
++    m_qmlWidget->setFocusPolicy( Qt::StrongFocus );  // RedNext: let text fields in QML pages take keys
+     m_qmlEngine = m_qmlWidget->engine();
+ #else
+     m_qmlEngine = new QQmlEngine( this );
+@@ -136,6 +137,10 @@
+     {
+         changeQMLState( QMLAction::Start, m_qmlObject );
+     }
++    if ( m_qmlWidget )
++    {
++        m_qmlWidget->setFocus( Qt::OtherFocusReason );  // RedNext: keyboard goes to the page
++    }
+ }
+ 
+ void
+@@ -192,7 +197,7 @@
+         }
+         else
+         {
+-#if QT_VERSION < QT_VERSION_CHECK( 6, 0, 0 )
++#if 1  // RedNext: QQuickWidget on Qt 6 too; the Qt 6 window container never gets keyboard focus
+             // setContent() is public API, but not documented publicly.
+             // It is marked \internal in the Qt sources, but does exactly
+             // what is needed: sets up visual parent by replacing the root
+diff -ru a/src/libcalamaresui/viewpages/QmlViewStep.h b/src/libcalamaresui/viewpages/QmlViewStep.h
+--- a/src/libcalamaresui/viewpages/QmlViewStep.h	2026-10-04 18:56:14.692624429 +0530
++++ b/src/libcalamaresui/viewpages/QmlViewStep.h	2026-10-04 18:56:14.712373262 +0530
+@@ -112,7 +112,7 @@
+     QWidget* m_widget = nullptr;
+     WaitingWidget* m_spinner = nullptr;
+ 
+-#if QT_VERSION < QT_VERSION_CHECK( 6, 0, 0 )
++#if 1  // RedNext: QQuickWidget on Qt 6 too (see QmlViewStep.cpp)
+     QQuickWidget* m_qmlWidget = nullptr;
+ #else
+     QWidget* m_qmlWidget = nullptr;  // Qt6: container for QQuickWindow

@@ -1,0 +1,9 @@
+# ISO images and their split parts are published as release assets, not in git
+*.iso
+*.iso.part-*
+# build work dirs
+rootfs/
+initramfs/
+iso/
+out/
+stage/

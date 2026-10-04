@@ -1,0 +1,11 @@
+#!/bin/bash
+# RedNext live only: start the installer (Calamares) as root.
+# The live user has passwordless sudo.
+pgrep -x calamares >/dev/null && exit 0
+# Calamares' QML pages don't get keyboard/mouse input on native Wayland, so always run it
+# through X11: XWayland under Hyprland and Plasma Wayland, the real X server under Plasma X11.
+xhost +si:localuser:root >/dev/null 2>&1
+# dark RedNext palette for every widget (kdeglobals in the branding dir), Fusion base style + stylesheet.qss on top
+exec sudo -E env HOME=/root XDG_CONFIG_HOME=/etc/calamares/branding/rednext/qtconfig \
+  QT_QPA_PLATFORM=xcb QT_QPA_PLATFORMTHEME=kde QT_STYLE_OVERRIDE=Fusion QT_QUICK_CONTROLS_STYLE=Basic \
+  /usr/bin/calamares "$@"

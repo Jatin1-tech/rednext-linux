@@ -1,0 +1,37 @@
+---
+componentName:  rednext
+welcomeStyleCalamares: false
+welcomeExpandingLogo: true
+windowExpanding: normal
+windowSize: 1120px,720px
+windowPlacement: center
+sidebar: qml
+navigation: qml
+
+strings:
+    productName:         "RedNext Linux"
+    shortProductName:    "RedNext"
+    version:             "2026.10"
+    shortVersion:        "2026.10"
+    versionedName:       "RedNext Linux 2026.10"
+    shortVersionedName:  "RedNext 2026.10"
+    bootloaderEntryName: "RedNext"
+    productUrl:          ""
+    supportUrl:          ""
+    knownIssuesUrl:      ""
+    releaseNotesUrl:     ""
+    donateUrl:           ""
+
+images:
+    productIcon:    "logo.png"
+    productLogo:    "logo.png"
+    productWelcome: "welcome.png"
+
+style:
+    SidebarBackground:        "#070707"
+    SidebarText:              "#EDEAEA"
+    SidebarTextCurrent:       "#FFFFFF"
+    SidebarBackgroundCurrent: "#D42A3C"
+
+slideshow:    "show.qml"
+slideshowAPI: 2

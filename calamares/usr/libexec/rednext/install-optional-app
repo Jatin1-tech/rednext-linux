@@ -1,0 +1,75 @@
+#!/bin/bash
+# RedNext installer: download one optional app from its official source and install
+# it into the target system at $2 under /opt. Called by the rednextapps job.
+#   install-optional-app {blender|spotify|intellij|pycharm|rider} TARGET_ROOT
+set -euo pipefail
+app=${1:?app}; R=${2:?target root}
+[ "$R" != / ] && [ -d "$R/etc" ] || { echo "bad target root: $R" >&2; exit 1; }
+# download onto the target disk, not the live session's RAM overlay
+mkdir -p "$R/var/tmp"; T=$(mktemp -d -p "$R/var/tmp" rednext-app.XXXXXX); trap 'rm -rf "$T"' EXIT
+fetch() { curl -fL --retry 3 --connect-timeout 20 -o "$2" "$1"; }
+
+desktop() {  # id name exec icon categories [wmclass]
+  install -Dm644 /dev/stdin "$R/usr/share/applications/$1.desktop" <<D
+[Desktop Entry]
+Type=Application
+Name=$2
+Exec=$3
+Icon=$4
+Terminal=false
+Categories=$5
+StartupWMClass=${6:-$1}
+D
+}
+
+jetbrains() {  # code dir name bin wmclass
+  local code=$1 dir=$2 name=$3 bin=$4 url
+  url=$(curl -fsSL "https://data.services.jetbrains.com/products/releases?code=$code&latest=true&type=release" |
+        python3 -c "import json,sys; d=json.load(sys.stdin); print(next(iter(d.values()))[0]['downloads']['linux']['link'])")
+  echo "downloading $name: $url"
+  fetch "$url" "$T/app.tar.gz"
+  rm -rf "$R/opt/$dir"; mkdir -p "$R/opt/$dir"
+  tar -xzf "$T/app.tar.gz" -C "$R/opt/$dir" --strip-components=1 --no-same-owner
+  local exe=/opt/$dir/bin/$bin; [ -x "$R$exe" ] || exe=/opt/$dir/bin/$bin.sh
+  ln -sfn "$exe" "$R/usr/local/bin/$bin"
+  desktop "jetbrains-$bin" "$name" "$exe %f" "/opt/$dir/bin/$bin.svg" "Development;IDE;" "$5"
+}
+
+case $app in
+  intellij) jetbrains IIU idea "IntelliJ IDEA" idea jetbrains-idea ;;
+  pycharm)  jetbrains PCP pycharm "PyCharm" pycharm jetbrains-pycharm ;;
+  rider)    jetbrains RD rider "Rider" rider jetbrains-rider ;;
+  blender)
+    rel=$(curl -fsSL https://download.blender.org/release/ | grep -oE 'Blender[0-9]+\.[0-9]+/' | sort -uV | tail -1)
+    file=$(curl -fsSL "https://download.blender.org/release/$rel" | grep -oE 'blender-[0-9.]+-linux-x64\.tar\.xz' | sort -uV | tail -1)
+    [ -n "$file" ] || { echo "no Blender linux build found in $rel" >&2; exit 1; }
+    echo "downloading Blender: $rel$file"
+    fetch "https://download.blender.org/release/$rel$file" "$T/app.tar.xz"
+    rm -rf "$R/opt/blender"; mkdir -p "$R/opt/blender"
+    tar -xJf "$T/app.tar.xz" -C "$R/opt/blender" --strip-components=1 --no-same-owner
+    ln -sfn /opt/blender/blender "$R/usr/local/bin/blender"
+    desktop blender "Blender" "/opt/blender/blender %f" /opt/blender/blender.svg "Graphics;3DGraphics;"
+    ;;
+  spotify)
+    # official Debian repository; the .deb is unpacked into /opt/spotify
+    base=http://repository.spotify.com
+    deb=$(curl -fsSL "$base/dists/testing/non-free/binary-amd64/Packages" |
+          awk '/^Package: spotify-client$/{p=1} p&&/^Filename:/{print $2; exit}')
+    [ -n "$deb" ] || { echo "spotify package not found" >&2; exit 1; }
+    echo "downloading Spotify: $base/$deb"
+    fetch "$base/$deb" "$T/spotify.deb"
+    ( cd "$T" && ar x spotify.deb && mkdir data && tar -xf data.tar.* -C data --no-same-owner )
+    rm -rf "$R/opt/spotify"; mkdir -p "$R/opt/spotify"
+    cp -a "$T/data/usr/share/spotify/." "$R/opt/spotify/"
+    # tray-icon libraries Spotify expects but RedNext doesn't ship system-wide
+    cp -a /usr/lib/rednext/spotify-deps "$R/opt/spotify/deps"
+    install -Dm755 /dev/stdin "$R/usr/local/bin/spotify" <<'L'
+#!/bin/sh
+export LD_LIBRARY_PATH="/opt/spotify/deps${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec /opt/spotify/spotify --enable-features=UseOzonePlatform --ozone-platform-hint=auto --no-zygote "$@"
+L
+    desktop spotify "Spotify" "/usr/local/bin/spotify %U" /opt/spotify/icons/spotify-linux-256.png "Audio;Music;Player;AudioVideo;"
+    ;;
+  *) echo "unknown app: $app" >&2; exit 1 ;;
+esac
+echo "$app installed"

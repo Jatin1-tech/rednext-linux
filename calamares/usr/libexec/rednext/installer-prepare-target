@@ -1,0 +1,37 @@
+#!/bin/bash
+# RedNext installer (Calamares shellprocess@prepare): turn the freshly copied live
+# image at $1 into an installed system. Runs on the live side, before the users job.
+set -euo pipefail
+R=${1:?usage: installer-prepare-target TARGET_ROOT}
+[ "$R" != / ] && [ -d "$R/etc" ] || { echo "bad target root: $R" >&2; exit 1; }
+ISO=/live/iso
+KVER=$(uname -r)
+
+echo "kernel $KVER + GRUB theme from the live medium (/boot is not in the squashfs)"
+install -Dm644 "$ISO/boot/vmlinuz" "$R/boot/vmlinuz-$KVER"
+mkdir -p "$R/boot/grub/themes"
+cp -a "$ISO/boot/grub/themes/." "$R/boot/grub/themes/"
+# no initramfs, so the kernel must find / by PARTUUID (UUID= needs an initramfs)
+sed -i '/^GRUB_DISABLE_LINUX_PARTUUID=/d; /^GRUB_TIMEOUT=/d; /^GRUB_DISABLE_OS_PROBER=/d' "$R/etc/default/grub"
+printf 'GRUB_TIMEOUT=5\nGRUB_DISABLE_LINUX_PARTUUID=false\n' >> "$R/etc/default/grub"
+
+echo "remove the live user and live-only setup"
+chroot "$R" /usr/sbin/userdel -r live 2>/dev/null || chroot "$R" /usr/sbin/userdel live 2>/dev/null || true
+rm -rf "$R/home/live"
+rm -f "$R/etc/sudoers.d/live"
+sed -i '/pam_succeed_if.so user = live/d' "$R/etc/pam.d/sddm"
+rm -f "$R/etc/systemd/system/rednext-live-readahead.service" \
+      "$R/etc/systemd/system/sysinit.target.wants/rednext-live-readahead.service" \
+      "$R/usr/libexec/rednext/live-readahead"
+sed -i 's#splash-min-time 6\.0#splash-min-time 5.2#' "$R/etc/systemd/system/plymouth-quit.service.d/rednext-min-time.conf"
+rmdir "$R/live" 2>/dev/null || rm -rf "$R/live"
+
+echo "remove the installer itself"
+if [ -f "$R/usr/lib/rednext/live-only.list" ]; then
+  while IFS= read -r p; do
+    case $p in /*) rm -rf -- "$R$p";; esac
+  done < "$R/usr/lib/rednext/live-only.list"
+fi
+rm -f "$R/usr/lib/rednext/live-only.list"
+ldconfig -r "$R" 2>/dev/null || true
+echo "target prepared"

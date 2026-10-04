@@ -1,0 +1,6 @@
+# RedNext: install the apps ticked on the "Extra apps" page
+---
+type:       "job"
+name:       "rednextapps"
+interface:  "python"
+script:     "main.py"
