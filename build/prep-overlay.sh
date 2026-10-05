@@ -23,6 +23,19 @@ mkdir -p "$S/.config/menus"
 ln -s /opt/kf6/etc/xdg/menus/plasma-applications.menu "$S/.config/menus/applications.menu"
 mkdir -p "$S/Pictures/Screenshots" "$S/Videos"
 
+# Dolphin: same panels as the build user (Places only, no terminal panel) and the same short
+# Places list. KF6 keeps both outside ~/.config, so without these Dolphin opens with its
+# defaults (terminal panel, long Places list). Only the toolbar/dock layout is taken from
+# dolphinstaterc (no "Open with" history, no screen geometry); home paths become @HOME@,
+# which /etc/profile.d/10-rednext-home-paths.sh fills in at the user's first login.
+mkdir -p "$S/.local/state" "$S/.local/share"
+if [ -f "$H/.local/state/dolphinstaterc" ]; then
+  { echo "[State]"; grep -E '^State=' "$H/.local/state/dolphinstaterc"; echo "RestorePositionForNextInstance=false"; } \
+    > "$S/.local/state/dolphinstaterc"
+fi
+[ -f "$H/.local/share/user-places.xbel" ] && \
+  sed "s#file://$H#file://@HOME@#g" "$H/.local/share/user-places.xbel" > "$S/.local/share/user-places.xbel"
+
 # Caelestia state: colour scheme + wallpaper pointing at the system copy
 WP=$(cat "$H/.local/state/caelestia/wallpaper/path.txt")
 WPN=rednext-default.${WP##*.}

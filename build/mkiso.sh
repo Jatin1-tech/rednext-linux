@@ -74,13 +74,15 @@ step_rootfs() {
   say "installer (Calamares) + RedNext config"
   rsync -rlptK --chown=root:root --exclude=/usr/include --exclude=/usr/lib/cmake --exclude=/usr/lib/pkgconfig \
     --exclude=/usr/share/cmake --exclude='*.a' "$IS/" "$R/"
-  rsync -rlptK --chown=root:root "$S/calamares/" "$R/"
+  # installer config tree: ../calamares in the GitHub repo layout, ./calamares in a flat scripts dir
+  CT=$S/../calamares; [ -d "$CT" ] || CT=$S/calamares
+  rsync -rlptK --chown=root:root "$CT/" "$R/"
   # everything the installed system must NOT keep; installer-prepare-target deletes these
   mkdir -p "$R/usr/lib/rednext"
   { ( cd "$IS" && find . -name '*calamares*' -prune -print | sed 's#^\.##' )
     printf '%s\n' /etc/calamares /usr/lib/calamares /usr/bin/rednext-installer \
       /usr/share/applications/rednext-installer.desktop /usr/libexec/rednext/installer-prepare-target \
-      /usr/libexec/rednext/install-optional-app /usr/lib/rednext/spotify-deps
+      /usr/libexec/rednext/install-optional-app /usr/libexec/rednext/rednext-disk /usr/lib/rednext/spotify-deps
   } | sort -u > "$R/usr/lib/rednext/live-only.list"
 
   say "scrub build-user paths from binaries (same-length rewrite, image copy only)"
@@ -176,6 +178,13 @@ UNIT
 pathprepend /usr/sbin
 pathprepend /usr/local/bin
 P
+  say "per-user home paths in skel files (Dolphin Places) -> filled at first login"
+  cat > "$R/etc/profile.d/10-rednext-home-paths.sh" <<'P'
+# RedNext: /etc/skel's Dolphin Places list holds @HOME@; point it at this user's home once
+_rn_f="$HOME/.local/share/user-places.xbel"
+[ -f "$_rn_f" ] && grep -q '@HOME@' "$_rn_f" 2>/dev/null && sed -i "s#@HOME@#$HOME#g" "$_rn_f"
+unset _rn_f
+P
   cat > "$R/etc/fish/conf.d/00-rednext-path.fish" <<'P'
 # RedNext: fish doesn't read /etc/profile; same PATH as profile.d/00-rednext-path.sh
 fish_add_path -gP /usr/local/bin /usr/sbin
@@ -212,6 +221,7 @@ P
   fishchk() { local d; d=$(mktemp -d -p "$R/tmp"); chroot "$R" env HOME="/tmp/${d##*/}" /usr/bin/fish -c 'command -q Hyprland; and command -q qs'; local r=$?; rm -rf "$d"; return $r; }
   chk "Hyprland on fish PATH"        "fishchk"
   chk "live splash hold 6.0 s"       "grep -q 'splash-min-time 6.0' $R/etc/systemd/system/plymouth-quit.service.d/rednext-min-time.conf"
+  chk "dolphin layout + places in skel" "[ -f $R/etc/skel/.local/state/dolphinstaterc ] && grep -q '@HOME@' $R/etc/skel/.local/share/user-places.xbel && [ -f $R/etc/profile.d/10-rednext-home-paths.sh ]"
   chk "skel in /home/live"           "[ -f $R/home/live/.config/hypr/hyprland.lua ]"
   local U=$BU
   chk "privacy: no '$U' in etc/var/root/home" "! grep -rIlsw -e '$U' ${PW[*]} $R/etc $R/var $R/root $R/home $R/opt $R/usr/local/etc"
@@ -221,7 +231,8 @@ P
   chk "privacy: /root empty" "[ -z \"\$(ls -A $R/root)\" ]"
   chk "privacy: no stray top-level files" "[ -z \"\$(find $R -maxdepth 1 -type f)\" ] && ! ls -d $R/.Trash-* >/dev/null 2>&1"
   chk "installer: calamares + config"  "[ -x $R/usr/bin/calamares ] && [ -f $R/etc/calamares/settings.conf ] && [ -f $R/etc/calamares/branding/rednext/branding.desc ]"
-  chk "installer: tools (unsquashfs, mkfs.fat, kpmcore)" "[ -x $R/usr/bin/unsquashfs ] && [ -x $R/usr/sbin/mkfs.fat ] && ls $R/usr/lib/libkpmcore.so.* >/dev/null"
+  chk "installer: tools (unsquashfs, mkfs.fat, sfdisk, wipefs, partx, mkswap)" "[ -x $R/usr/bin/unsquashfs ] && [ -x $R/usr/sbin/mkfs.fat ] && chroot $R /bin/sh -c 'for t in sfdisk wipefs partx blockdev mkswap mkfs.ext4 findmnt udevadm; do command -v \$t >/dev/null || exit 1; done'"
+  chk "installer: disk engine + page" "[ -x $R/usr/libexec/rednext/rednext-disk ] && [ -d $R/usr/lib/calamares/modules/rednextdisk ] && [ -f $R/etc/calamares/branding/rednext/rednext-disk.qml ] && REDNEXT_DISK_FAKE= chroot $R /usr/libexec/rednext/rednext-disk --help >/dev/null"
   chk "installer: calamares libs resolve" "! chroot $R /usr/bin/ldd /usr/bin/calamares | grep -q 'not found'"
   chk "installer: live launchers" "[ -x $R/home/live/Desktop/rednext-installer.desktop ] && grep -q rednext-installer $R/home/live/.config/caelestia/hypr-user.lua"
   chk "installer: nothing live-only in skel" "! grep -rqs rednext-installer $R/etc/skel"

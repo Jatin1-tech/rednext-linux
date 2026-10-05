@@ -1,10 +1,12 @@
 #!/bin/bash
 # Build the ISO tools and the Calamares installer stack as the normal user (no sudo).
 #   tools/stage      host-side build tools for mkiso.sh (mksquashfs, xorriso, mtools)
-#   installer/stage  shipped inside the live image only (calamares, kpmcore, yaml-cpp,
-#                    dosfstools, squashfs-tools); never installed on the build host
+#   installer/stage  shipped inside the live image only (calamares + the rednextdisk page,
+#                    yaml-cpp, dosfstools, squashfs-tools); never installed on the build host
+# Partitioning is RedNext's own (installer/rednextdisk + calamares/usr/libexec/rednext/rednext-disk),
+# so neither kpmcore nor Calamares' partition module is built.
 # Sources are expected in $W/src (see SRC list below). Build trees are deleted afterwards.
-# Usage: ./build-installer.sh [tools] [installer] [calamares]   (default: tools installer)
+# Usage: ./build-installer.sh [tools] [installer] [yamlcpp] [calamares]   (default: tools installer)
 set -euo pipefail
 W=${W:-$HOME/apps/dl/rednext-iso}
 SRC=$W/src
@@ -36,6 +38,11 @@ step_tools() {
   ./configure --prefix=/usr --disable-floppyd >/dev/null; make -j$J >/dev/null; make DESTDIR="$TS" install >/dev/null
   unpack xorriso 'xorriso-*.tar.gz'
   ./configure --prefix=/usr >/dev/null; make -j$J >/dev/null; make DESTDIR="$TS" install >/dev/null
+  # gen_init_cpio (mkiso.sh packs the initramfs with it; there's no cpio binary): one file of the kernel tree
+  local ksrc; ksrc=$(ls /sources/LFS/linux-6.*.tar.xz 2>/dev/null | head -1)
+  [ -n "$ksrc" ] || { echo "kernel tarball not found in /sources/LFS" >&2; exit 1; }
+  mkdir -p "$B/gic"; tar -xJf "$ksrc" -C "$B/gic" --wildcards '*/usr/gen_init_cpio.c' --strip-components=2
+  gcc -O2 -o "$TS/usr/bin/gen_init_cpio" "$B/gic/gen_init_cpio.c"
   ls "$TS/usr/bin"
 }
 
@@ -53,24 +60,29 @@ step_installer() {
   unpack dosfstools 'dosfstools-*.tar.gz'
   ./configure --prefix=/usr --sbindir=/usr/sbin --enable-compat-symlinks --mandir=/usr/share/man >/dev/null
   make -j$J >/dev/null; make DESTDIR="$IS" install >/dev/null
-  unpack yaml-cpp 'yaml-cpp-*.tar.gz'
-  cm -DYAML_BUILD_SHARED_LIBS=ON -DYAML_CPP_BUILD_TESTS=OFF -DYAML_CPP_BUILD_TOOLS=OFF
-  unpack kpmcore 'kpmcore-*.tar.xz'
-  # plugins go to /usr/lib/plugins, which is on QT_PLUGIN_PATH (profile.d/qt6.sh)
-  cm -DKDE_INSTALL_PLUGINDIR=lib/plugins -DKDE_INSTALL_QTPLUGINDIR=lib/plugins
+  step_yamlcpp
   step_calamares
 }
 
-# Calamares alone (needs the yaml-cpp/kpmcore headers still in $IS): ./build-installer.sh calamares
+step_yamlcpp() {
+  say "yaml-cpp -> $IS"
+  unpack yaml-cpp 'yaml-cpp-*.tar.gz'
+  cm -DYAML_BUILD_SHARED_LIBS=ON -DYAML_CPP_BUILD_TESTS=OFF -DYAML_CPP_BUILD_TOOLS=OFF
+}
+
+# Calamares alone (needs the yaml-cpp headers still in $IS): ./build-installer.sh calamares
 step_calamares() {
   say "calamares -> $IS"
   unpack calamares 'calamares-*.tar.gz'
   # QML pages must take keyboard input (upstream's Qt 6 window container never gets focus)
-  patch -p1 < "$(dirname "$(readlink -f "$0")")/calamares-qml-focus.patch"
+  local here; here=$(dirname "$(readlink -f "$0")")
+  patch -p1 < "$here/calamares-qml-focus.patch"
+  # RedNext's own disk page (QML + rednext-disk engine) replaces the kpmcore partition module
+  cp -r "$here/../installer/rednextdisk" src/modules/
   cm -DYAMLCPP_DIR="$IS/usr" -DWITH_QT6=ON -DWITH_PYTHON=ON -DWITH_PYBIND11=ON -DINSTALL_CONFIG=OFF -DINSTALL_POLKIT=ON \
      -DWITH_APPSTREAM=OFF -DWITH_PYTHONQT=OFF \
      -DSKIP_MODULES="webview dracut dracutlukscfg initramfs initramfscfg initcpio initcpiocfg mkinitfs \
-       luksbootkeyfile luksopenswaphookcfg openrcdmcryptcfg plymouthcfg packages netinstall \
+       partition fsresizer luksbootkeyfile luksopenswaphookcfg openrcdmcryptcfg plymouthcfg packages netinstall \
        tracking zfs zfshostid dummycpp dummyprocess dummypython dummypythonqt rawfs services-openrc \
        license notesqml oemid interactiveterminal"
   # headers/cmake/pkgconfig stay in the stage for rebuilds; mkiso.sh leaves them out of the image

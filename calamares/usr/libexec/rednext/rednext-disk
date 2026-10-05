@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+rednext-disk: the RedNext installer's storage engine.
+
+Modelled on Fedora's Anaconda/Blivet storage pipeline (see the "Fedora 43 Anaconda
+Storage Pipeline" notes): the UI never runs partitioning commands. It asks for a
+*plan*: a model of the final disk layout plus an ordered action list. Nothing
+touches the disk until `commit`, which re-probes, checks the disk did not change
+since the plan was shown, and runs the actions in Blivet's order:
+
+    destroy formats -> destroy partitions -> write table -> settle/verify
+    -> wipe new partitions -> create formats -> mount
+
+  rednext-disk probe                      JSON: firmware, disks, partitions, free space
+  rednext-disk plan  REQUEST.json|-       JSON: final layout, actions, errors/warnings
+  rednext-disk commit REQUEST.json --root DIR [--dry-run]
+                                          runs the plan; JSON: partitions for Calamares
+
+Request:
+  {"mode": "erase"|"free"|"manual", "disk": "/dev/sdX", "fs": "ext4",
+   "swap": "none"|"file", "rootSize": <bytes, 0 = all>, "region": <free region index>,
+   "manual": {"delete": [N...],
+              "use":    [{"number": N, "mountPoint": "/home", "format": false, "fs": "ext4"}],
+              "create": [{"size": <bytes, 0 = rest>, "mountPoint": "/", "fs": "ext4"}]}}
+
+Testing without real disks: REDNEXT_DISK_FAKE=probe.json makes `probe` return that
+file (firmware/disks as produced by probe), and commit --dry-run only prints commands.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+MiB = 1024 ** 2
+GiB = 1024 ** 3
+TiB = 1024 ** 4
+ALIGN = MiB                      # every new partition starts and ends on 1 MiB
+MIN_FREE = 16 * MiB              # smaller gaps are not offered as free space
+MIN_ROOT = int(os.environ.get("REDNEXT_MIN_ROOT", 20 * GiB))
+REC_ROOT = int(os.environ.get("REDNEXT_REC_ROOT", 40 * GiB))
+ESP_SIZE = 1 * GiB
+ESP_MIN = 64 * MiB
+BIOSGRUB_SIZE = 1 * MiB
+LIVE_MOUNT = os.environ.get("REDNEXT_LIVE_MOUNT", "/live/iso")
+ALLOW_LOOP = os.environ.get("REDNEXT_DISK_ALLOW_LOOP") == "1"
+
+# GPT type GUIDs / MBR ids
+T_ESP = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+T_BIOSGRUB = "21686148-6449-6E6F-744E-656564454649"
+T_ROOT = "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"     # Linux root (x86-64)
+T_HOME = "933AC7E1-2EB4-4F13-B844-0E14E2AEF915"
+T_SWAP = "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"
+T_LINUX = "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+M_LINUX, M_SWAP, M_ESP = "83", "82", "ef"
+MBR_EXTENDED = {"5", "f", "85", "0x5", "0xf", "0x85"}
+
+# mount points that must live on / (the live image is copied there as one tree)
+FORBIDDEN_MP = {"/bin", "/sbin", "/lib", "/lib64", "/etc", "/usr", "/dev", "/proc",
+                "/sys", "/run", "/live", "/root"}
+FS_LABEL = {"/": "RedNext", "/home": "home", "/boot/efi": "EFI", "/boot": "boot"}
+
+
+class PlanError(Exception):
+    pass
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def run(cmd, check=True, capture=True, input_=None):
+    log("+ " + " ".join(cmd))
+    p = subprocess.run(cmd, input=input_, text=True,
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.PIPE if capture else None)
+    if p.stdout and p.stdout.strip():
+        log(p.stdout.rstrip())
+    if p.stderr and p.stderr.strip():
+        log(p.stderr.rstrip())
+    if check and p.returncode != 0:
+        raise PlanError("command failed (%d): %s\n%s" % (p.returncode, " ".join(cmd),
+                                                        (p.stderr or "").strip()))
+    return p
+
+
+def human(n):
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return ("%.0f %s" if unit in ("B", "KiB") or n >= 100 or n == int(n) else "%.1f %s") % (n, unit)
+        n /= 1024
+    return str(n)
+
+
+def align_up(n):
+    return (n + ALIGN - 1) // ALIGN * ALIGN
+
+
+def align_down(n):
+    return n // ALIGN * ALIGN
+
+
+def part_path(disk_path, number):
+    return "%s%s%d" % (disk_path, "p" if disk_path[-1].isdigit() else "", number)
+
+
+def available_fs():
+    fs = ["ext4"]
+    for name, tool in (("btrfs", "mkfs.btrfs"), ("xfs", "mkfs.xfs")):
+        if shutil.which(tool):
+            fs.append(name)
+    return fs
+
+
+# ----------------------------------------------------------------------------- probe
+
+def firmware():
+    if os.environ.get("REDNEXT_FIRMWARE") in ("efi", "bios"):
+        return os.environ["REDNEXT_FIRMWARE"]
+    return "efi" if os.path.isdir("/sys/firmware/efi") else "bios"
+
+
+def read_sys(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def live_disks():
+    """Disks that hold the running live medium (never offered as a target)."""
+    out = set()
+    p = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "--target", LIVE_MOUNT],
+                       text=True, capture_output=True)
+    src = p.stdout.strip() if p.returncode == 0 else ""
+    if src.startswith("/dev/"):
+        q = subprocess.run(["lsblk", "-n", "-s", "-o", "NAME,TYPE", "-r", src],
+                           text=True, capture_output=True)
+        for line in q.stdout.splitlines():
+            name, _, typ = line.partition(" ")
+            if typ == "disk":
+                out.add("/dev/" + name)
+    return out
+
+
+def sfdisk_table(disk):
+    """Authoritative table from sfdisk (needs root); None if unavailable."""
+    if os.geteuid() != 0:
+        return None
+    p = subprocess.run(["sfdisk", "--json", disk], text=True, capture_output=True)
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout).get("partitiontable")
+    except ValueError:
+        return None
+
+
+def probe():
+    fake = os.environ.get("REDNEXT_DISK_FAKE")
+    if fake:
+        with open(fake) as f:
+            data = json.load(f)
+        for d in data["disks"]:
+            finish_disk(d)
+        data.setdefault("firmware", firmware())
+        data["filesystems"] = available_fs()
+        data["minRoot"], data["recRoot"] = MIN_ROOT, REC_ROOT
+        return data
+
+    cols = "NAME,PATH,TYPE,SIZE,FSTYPE,LABEL,PARTTYPE,PARTUUID,PARTLABEL,UUID,MOUNTPOINTS," \
+           "RM,RO,TRAN,MODEL,PTTYPE,FSUSED,PARTN,LOG-SEC"
+    p = subprocess.run(["lsblk", "-J", "-b", "-o", cols], text=True, capture_output=True)
+    if p.returncode != 0:  # older lsblk without PARTN
+        cols = cols.replace(",PARTN", "")
+        p = subprocess.run(["lsblk", "-J", "-b", "-o", cols], text=True, capture_output=True, check=True)
+    tree = json.loads(p.stdout)["blockdevices"]
+    live = live_disks()
+    swaps = set()
+    for line in (read_sys("/proc/swaps", "") or "").splitlines()[1:]:
+        swaps.add(line.split()[0])
+
+    disks = []
+    for b in tree:
+        typ = b.get("type")
+        if typ not in ("disk", "loop") or (typ == "loop" and not ALLOW_LOOP):
+            continue
+        name = b["name"]
+        if re.match(r"^(zram|ram|sr|fd|md|dm-)", name) or not b.get("size"):
+            continue
+        sysd = "/sys/block/%s" % name
+        d = {
+            "name": name, "path": b["path"], "size": int(b["size"]),
+            "model": (b.get("model") or "").strip() or ("Loop device" if typ == "loop" else "Disk"),
+            "transport": b.get("tran") or ("nvme" if name.startswith("nvme") else ""),
+            "removable": bool(b.get("rm")), "readOnly": bool(b.get("ro")),
+            "sectorSize": int(b.get("log-sec") or read_sys(sysd + "/queue/logical_block_size", 512)),
+            "rotational": read_sys(sysd + "/queue/rotational") == "1",
+            "ptType": b.get("pttype"), "liveMedium": b["path"] in live,
+            "wholeDiskFs": b.get("fstype") if not b.get("children") else None,
+            "partitions": [],
+        }
+        table = sfdisk_table(b["path"])
+        bykids = {c["path"]: c for c in (b.get("children") or []) if c.get("type") == "part"}
+        if table:
+            d["ptType"] = table.get("label", d["ptType"])
+            ss = int(table.get("sectorsize", d["sectorSize"]))
+            for e in table.get("partitions", []):
+                c = bykids.get(e["node"], {})
+                num = int(re.search(r"(\d+)$", e["node"]).group(1))
+                d["partitions"].append(part_entry(e["node"], num, int(e["start"]) * ss,
+                                                  int(e["size"]) * ss, e.get("type", ""), c, swaps))
+        else:
+            for path, c in bykids.items():
+                pname = c["name"]
+                num = int(c.get("partn") or read_sys("/sys/class/block/%s/partition" % pname, 0))
+                start = int(read_sys("/sys/class/block/%s/start" % pname, 0)) * 512
+                size = int(read_sys("/sys/class/block/%s/size" % pname, 0)) * 512
+                d["partitions"].append(part_entry(path, num, start, size, c.get("parttype") or "", c, swaps))
+        finish_disk(d)
+        disks.append(d)
+    return {"firmware": firmware(), "disks": disks, "filesystems": available_fs(),
+            "minRoot": MIN_ROOT, "recRoot": REC_ROOT}
+
+
+def part_entry(path, num, start, size, ptype, c, swaps):
+    mps = [m for m in (c.get("mountpoints") or []) if m]
+    if path in swaps and "[SWAP]" not in mps:
+        mps.append("[SWAP]")
+    ptype = (ptype or "").lower()
+    return {
+        "number": num, "path": path, "start": start, "size": size,
+        "type": ptype, "fs": c.get("fstype") or "", "label": c.get("label") or c.get("partlabel") or "",
+        "uuid": c.get("uuid") or "", "partuuid": c.get("partuuid") or "",
+        "used": int(c["fsused"]) if c.get("fsused") else None,
+        "mounted": mps,
+        "esp": ptype.upper() == T_ESP or ptype in ("ef", "0xef"),
+        "biosGrub": ptype.upper() == T_BIOSGRUB,
+        "extended": ptype in MBR_EXTENDED,
+    }
+
+
+def finish_disk(d):
+    """Derived facts: logical partitions, free regions, why a disk can't be used."""
+    parts = sorted(d["partitions"], key=lambda p: p["start"])
+    d["partitions"] = parts
+    ext = next((p for p in parts if p.get("extended")), None)
+    if ext:
+        logicals = [p for p in parts if p["number"] >= 5]
+        for p in logicals:
+            p["logical"] = True
+        # sysfs reports a 1 KiB extended partition: span it over its logicals
+        if logicals:
+            end = max(p["start"] + p["size"] for p in logicals)
+            ext["size"] = max(ext["size"], end - ext["start"])
+    d["free"] = free_regions(d["size"], d.get("ptType") or "gpt",
+                             [p for p in parts if not p.get("logical")])
+    d["largestFree"] = max([r["size"] for r in d["free"]] or [0])
+    d["inUse"] = sorted({m for p in parts for m in p.get("mounted", [])})
+    why = []
+    if d.get("liveMedium"):
+        why.append("This is the RedNext live USB you booted from.")
+    if d.get("readOnly"):
+        why.append("The disk is read-only.")
+    if d["size"] < MIN_ROOT + ESP_SIZE:
+        why.append("Too small: RedNext needs at least %s." % human(MIN_ROOT + ESP_SIZE))
+    d["usable"] = not why
+    d["why"] = " ".join(why)
+    if d.get("ptType") not in ("gpt", "dos", None, ""):
+        d["ptType"] = d.get("ptType")
+    d["canErase"] = d["usable"] and not any(m for m in d["inUse"] if m != "[SWAP]" and not
+                                              m.startswith(("/run/media/", "/media/")))
+    return d
+
+
+def free_regions(disk_size, pttype, parts):
+    """Aligned unpartitioned gaps (Blivet get_free_regions)."""
+    first = ALIGN
+    last = disk_size - (ALIGN if pttype == "gpt" else 0)   # GPT backup header lives at the end
+    regions, cur = [], first
+    for p in sorted(parts, key=lambda p: p["start"]):
+        s = align_up(cur)
+        e = align_down(min(p["start"], last))
+        if e - s >= MIN_FREE:
+            regions.append({"start": s, "size": e - s})
+        cur = max(cur, p["start"] + p["size"])
+    s, e = align_up(cur), align_down(last)
+    if e - s >= MIN_FREE:
+        regions.append({"start": s, "size": e - s})
+    return regions
+
+
+# ----------------------------------------------------------------------------- plan
+
+def find_disk(state, path):
+    for d in state["disks"]:
+        if d["path"] == path:
+            return d
+    raise PlanError("Disk %s was not found. Plug it in and press Refresh." % path)
+
+
+def fingerprint(d):
+    return [d["size"], d.get("ptType")] + [[p["number"], p["start"], p["size"]] for p in d["partitions"]]
+
+
+def gpt_type(mp, fs):
+    if fs == "swap":
+        return T_SWAP
+    return {"/": T_ROOT, "/home": T_HOME, "/boot/efi": T_ESP}.get(mp, T_LINUX)
+
+
+def mbr_type(mp, fs):
+    return M_SWAP if fs == "swap" else (M_ESP if mp == "/boot/efi" else M_LINUX)
+
+
+def allocate(regions, requests):
+    """Blivet allocate_partitions + grow_partitions, simplified: fixed-size requests
+    first-fit in disk order, then the single growable request takes the largest gap."""
+    regions = [dict(r) for r in sorted(regions, key=lambda r: r["start"])]
+    fixed = [r for r in requests if r["size"] > 0]
+    grow = [r for r in requests if r["size"] <= 0]
+    if len(grow) > 1:
+        raise PlanError("Only one new partition can use \"all remaining space\".")
+    for r in fixed:
+        need = align_up(r["size"])
+        for g in regions:
+            if g["size"] >= need:
+                r["start"], r["size"] = g["start"], need
+                g["start"] += need
+                g["size"] -= need
+                break
+        else:
+            raise PlanError("Not enough free space for %s (%s)." % (r["what"], human(need)))
+    for r in grow:
+        g = max(regions, key=lambda g: g["size"]) if regions else None
+        if not g or g["size"] < MIN_FREE:
+            raise PlanError("No free space left for %s." % r["what"])
+        r["start"], r["size"] = g["start"], align_down(g["size"])
+        g["size"] = 0
+    return requests
+
+
+def plan(state, req):
+    errors, warnings = [], []
+    fw = state["firmware"]
+    mode = req.get("mode", "erase")
+    d = find_disk(state, req.get("disk") or "")
+    if not d["usable"]:
+        raise PlanError(d["why"])
+    fs_root = req.get("fs") or "ext4"
+    if fs_root not in state["filesystems"]:
+        raise PlanError("File system %s is not available on this live image." % fs_root)
+
+    keep = list(d["partitions"])   # existing partitions that stay
+    delete, reuse, creates = [], [], []
+
+    if mode == "erase":
+        if not d["canErase"]:
+            raise PlanError("A partition on this disk is in use (%s)." % ", ".join(d["inUse"]))
+        pt = "gpt" if (fw == "efi" or d["size"] > 2 * TiB) else "dos"
+        delete, keep = list(d["partitions"]), []
+        regions = free_regions(d["size"], pt, [])
+        if fw == "efi":
+            creates.append(new_req("/boot/efi", "vfat", ESP_SIZE, "the EFI system partition"))
+        elif pt == "gpt":
+            creates.append(new_req(None, "biosgrub", BIOSGRUB_SIZE, "the BIOS boot partition"))
+        creates.append(new_req("/", fs_root, 0, "RedNext"))
+    else:
+        pt = d.get("ptType") or ""
+        if pt not in ("gpt", "dos"):
+            raise PlanError("This disk has no partition table. Choose \"Use entire disk\".")
+        if mode == "free":
+            if not d["free"]:
+                raise PlanError("This disk has no free space. Choose \"Use entire disk\" or \"Custom\".")
+            idx = req.get("region")
+            if idx is None or not (0 <= int(idx) < len(d["free"])):
+                idx = max(range(len(d["free"])), key=lambda i: d["free"][i]["size"])
+            region = d["free"][int(idx)]
+            regions = [region]
+            size = int(req.get("rootSize") or 0)
+            boot_reqs = boot_requests(fw, pt, d, keep, [])
+            creates.extend(boot_reqs)
+            if size and size > region["size"] - sum(r["size"] for r in boot_reqs):
+                size = 0
+            creates.append(new_req("/", fs_root, size, "RedNext"))
+            for r in boot_reqs:
+                if r["mountPoint"] == "/boot/efi" and r.get("reuse"):
+                    reuse.append(r["reuse"])
+            creates = [r for r in creates if not r.get("reuse")]
+        elif mode == "manual":
+            m = req.get("manual") or {}
+            dels = {int(n) for n in m.get("delete", [])}
+            for p in d["partitions"]:
+                if p["number"] in dels:
+                    if p.get("logical"):
+                        raise PlanError("Deleting logical partitions (%s) is not supported. "
+                                        "Use \"Use entire disk\" instead." % p["path"])
+                    if p.get("extended") and any(q.get("logical") and q["number"] not in dels
+                                                 for q in d["partitions"]):
+                        raise PlanError("Delete the logical partitions inside %s first." % p["path"])
+                    if p["mounted"]:
+                        raise PlanError("%s is in use (%s) and can't be deleted." % (p["path"], ", ".join(p["mounted"])))
+                    delete.append(p)
+            keep = [p for p in d["partitions"] if p not in delete]
+            for u in m.get("use", []):
+                p = next((p for p in keep if p["number"] == int(u["number"])), None)
+                if not p:
+                    raise PlanError("Partition %s is gone or marked for deletion." % u["number"])
+                if p["mounted"] and u.get("format", True):
+                    raise PlanError("%s is in use (%s) and can't be formatted." % (p["path"], ", ".join(p["mounted"])))
+                fs = u.get("fs") or ("vfat" if u.get("mountPoint") == "/boot/efi" else
+                                     ("swap" if u.get("mountPoint") == "swap" else fs_root))
+                reuse.append({"part": p, "mountPoint": u.get("mountPoint"), "format": bool(u.get("format", True)),
+                              "fs": fs if u.get("format", True) else norm_fs(p["fs"])})
+            for c in m.get("create", []):
+                mp = c.get("mountPoint")
+                fs = c.get("fs") or ("vfat" if mp == "/boot/efi" else ("swap" if mp == "swap" else fs_root))
+                creates.append(new_req(mp, fs, int(c.get("size") or 0), mp or "a partition"))
+            regions = free_regions(d["size"], pt, [p for p in keep if not p.get("logical")])
+            # an MBR/GPT disk on BIOS still needs its boot pieces even in custom mode
+            if fw == "bios" and pt == "gpt" and not any(p["biosGrub"] for p in keep):
+                creates.insert(0, new_req(None, "biosgrub", BIOSGRUB_SIZE, "the BIOS boot partition"))
+        else:
+            raise PlanError("Unknown mode %r." % mode)
+
+    allocate(regions, creates)
+
+    # --- number the new partitions (lowest free slot, like fdisk/sfdisk)
+    used = {p["number"] for p in keep}
+    maxn = 128 if pt == "gpt" else 4
+    for r in sorted(creates, key=lambda r: r["start"]):
+        n = next((i for i in range(1, maxn + 1) if i not in used), None)
+        if n is None:
+            raise PlanError("No free partition slot left on this %s disk (an MBR disk holds at most 4 "
+                            "primary partitions). Delete one, or use the entire disk." % pt.upper())
+        if pt == "dos" and r["start"] + r["size"] > 2 * TiB:
+            raise PlanError("MBR disks can't use space beyond 2 TB. Use the entire disk (GPT).")
+        used.add(n)
+        r["number"] = n
+        r["path"] = part_path(d["path"], n)
+
+    # --- the final mount table
+    mounts = []
+    for r in creates:
+        if r["fs"] == "biosgrub":
+            continue
+        mounts.append({"path": r["path"], "number": r["number"], "mountPoint": r["mountPoint"],
+                       "fs": r["fs"], "format": True, "new": True, "size": r["size"]})
+    for u in reuse:
+        p = u["part"]
+        mounts.append({"path": p["path"], "number": p["number"], "mountPoint": u["mountPoint"],
+                       "fs": u["fs"], "format": u["format"], "new": False, "size": p["size"],
+                       "label": p.get("label", "")})
+    validate(fw, pt, d, mounts, keep, creates, errors, warnings, mode)
+
+    # --- final layout (for the "after" bar) and the action list (Blivet order)
+    layout = []
+    for p in keep:
+        if p.get("logical"):
+            continue
+        mt = next((m for m in mounts if not m["new"] and m["number"] == p["number"]), None)
+        layout.append({"kind": ("format" if mt["format"] else "use") if mt else "keep",
+                       "number": p["number"], "path": p["path"], "start": p["start"], "size": p["size"],
+                       "fs": (mt["fs"] if mt and mt["format"] else p["fs"]), "label": p.get("label", ""),
+                       "mountPoint": mt["mountPoint"] if mt else None, "extended": p.get("extended", False)})
+    for r in creates:
+        layout.append({"kind": "new", "number": r["number"], "path": r["path"], "start": r["start"],
+                       "size": r["size"], "fs": r["fs"], "label": FS_LABEL.get(r["mountPoint"] or "", ""),
+                       "mountPoint": r["mountPoint"]})
+    layout.sort(key=lambda s: s["start"])
+    layout = with_gaps(layout, d["size"], pt)
+
+    actions = []
+    if mode == "erase":
+        actions.append(act("destroy", "Erase everything on %s (%s, %s)" % (d["path"], d["model"], human(d["size"]))))
+        actions.append(act("table", "Create a new %s partition table" % ("GPT" if pt == "gpt" else "MBR")))
+    else:
+        for p in delete:
+            actions.append(act("delete", "Delete %s (%s%s, %s)" % (p["path"], p["fs"] or "unformatted",
+                                                                    ", " + p["label"] if p.get("label") else "",
+                                                                    human(p["size"]))))
+    for r in sorted(creates, key=lambda r: r["start"]):
+        what = {"vfat": "EFI system partition (FAT32)", "biosgrub": "BIOS boot partition",
+                "swap": "swap"}.get(r["fs"], r["fs"])
+        actions.append(act("create", "Create %s: %s, %s%s" % (r["path"], what, human(r["size"]),
+                                                              (" for " + r["mountPoint"]) if r["mountPoint"] and r["mountPoint"] != "swap" else "")))
+    for m in mounts:
+        if not m["new"] and m["format"]:
+            actions.append(act("format", "Format %s as %s (its data is erased)" % (m["path"], m["fs"])))
+    for m in sorted(mounts, key=lambda m: (m["mountPoint"] or "~")):
+        if m["mountPoint"] and m["mountPoint"] != "swap":
+            actions.append(act("mount", "Use %s as %s%s" % (m["path"], m["mountPoint"],
+                                                           "" if m["format"] else " (keep its files)")))
+        elif m["mountPoint"] == "swap":
+            actions.append(act("mount", "Use %s as swap" % m["path"]))
+    if req.get("swap") == "file":
+        actions.append(act("mount", "Create a swap file in /swapfile"))
+    if fw == "bios":
+        actions.append(act("boot", "Install the GRUB boot loader to %s (BIOS)" % d["path"]))
+    else:
+        esp = next((m for m in mounts if m["mountPoint"] == "/boot/efi"), None)
+        actions.append(act("boot", "Install the GRUB boot loader to %s (UEFI)" % (esp["path"] if esp else "?")))
+
+    root = next((m for m in mounts if m["mountPoint"] == "/"), None)
+    return {
+        "ok": not errors, "errors": errors, "warnings": warnings, "request": req,
+        "mode": mode, "firmware": fw, "disk": d["path"], "diskModel": d["model"], "diskSize": d["size"],
+        "ptType": pt, "fingerprint": fingerprint(d), "erase": mode == "erase",
+        "before": with_gaps([dict(p, kind="keep") for p in d["partitions"] if not p.get("logical")],
+                            d["size"], d.get("ptType") or "gpt"),
+        "after": layout, "actions": actions, "mounts": mounts,
+        "creates": [{k: r[k] for k in ("number", "path", "start", "size", "fs", "mountPoint")} for r in creates],
+        "deletes": [p["number"] for p in delete],
+        "rootSize": root["size"] if root else 0,
+        "destroyBytes": sum(p["size"] for p in delete) + sum(m["size"] for m in mounts if not m["new"] and m["format"]),
+        "swap": req.get("swap", "none"),
+    }
+
+
+def new_req(mp, fs, size, what):
+    return {"mountPoint": mp, "fs": fs, "size": size, "what": what}
+
+
+def norm_fs(fs):
+    return {"fat32": "vfat", "fat16": "vfat", "linuxswap": "swap"}.get(fs, fs)
+
+
+def boot_requests(fw, pt, d, keep, _):
+    """What a non-erase install needs to boot (Anaconda's 'boot device' requirement)."""
+    if fw == "efi":
+        esp = next((p for p in keep if p["esp"] and p["size"] >= ESP_MIN), None)
+        if esp:   # share the existing ESP (Windows/other Linux); don't format it
+            return [{"mountPoint": "/boot/efi", "fs": "vfat", "size": 0, "what": "EFI",
+                     "reuse": {"part": esp, "mountPoint": "/boot/efi", "format": False, "fs": "vfat"}}]
+        return [new_req("/boot/efi", "vfat", ESP_SIZE, "the EFI system partition")]
+    if pt == "gpt" and not any(p["biosGrub"] for p in keep):
+        return [new_req(None, "biosgrub", BIOSGRUB_SIZE, "the BIOS boot partition")]
+    return []
+
+
+def validate(fw, pt, d, mounts, keep, creates, errors, warnings, mode):
+    seen = {}
+    for m in mounts:
+        mp = m["mountPoint"]
+        if not mp:
+            errors.append("%s has no mount point. Pick one or remove it." % m["path"])
+            continue
+        if mp != "swap":
+            if not mp.startswith("/") or " " in mp or (len(mp) > 1 and mp.endswith("/")):
+                errors.append("%r is not a valid mount point." % mp)
+            if mp in FORBIDDEN_MP or any(mp.startswith(f + "/") for f in FORBIDDEN_MP):
+                errors.append("%s must stay on the / partition." % mp)
+            if mp in seen:
+                errors.append("%s is used twice (%s and %s)." % (mp, seen[mp], m["path"]))
+            seen[mp] = m["path"]
+        if mp == "/boot/efi" and m["fs"] != "vfat":
+            errors.append("/boot/efi must be FAT32 (vfat).")
+        if mp == "swap" and m["fs"] != "swap":
+            errors.append("%s: swap needs the swap format." % m["path"])
+        if not m["format"] and m["fs"] in ("", None):
+            errors.append("%s has no file system. Turn on \"Format\"." % m["path"])
+        if not m["format"] and mp in ("/", "/boot"):
+            errors.append("%s has to be formatted (RedNext is copied onto a clean %s)." % (m["path"], mp))
+    root = seen.get("/")
+    if not root:
+        errors.append("Choose a partition for / (the RedNext system).")
+    else:
+        size = next(m["size"] for m in mounts if m["mountPoint"] == "/")
+        if size < MIN_ROOT:
+            errors.append("/ is %s; RedNext needs at least %s." % (human(size), human(MIN_ROOT)))
+        elif size < REC_ROOT:
+            warnings.append("/ is %s. It works, but %s or more leaves room for apps." % (human(size), human(REC_ROOT)))
+    if fw == "efi":
+        esp = next((m for m in mounts if m["mountPoint"] == "/boot/efi"), None)
+        if not esp:
+            errors.append("This PC boots in UEFI mode: add an EFI system partition at /boot/efi "
+                          "(FAT32, %s)." % human(ESP_SIZE))
+        elif esp["size"] < ESP_MIN:
+            errors.append("The EFI partition is too small (%s); it needs %s." % (human(esp["size"]), human(ESP_MIN)))
+        elif not esp["format"]:
+            warnings.append("The existing EFI partition %s is shared; other systems' boot files stay." % esp["path"])
+    if fw == "bios" and pt == "gpt" and not (any(p["biosGrub"] for p in keep) or
+                                             any(r["fs"] == "biosgrub" for r in creates)):
+        errors.append("BIOS boot on a GPT disk needs a 1 MB BIOS boot partition.")
+    if fw == "efi" and pt == "dos" and mode != "erase":
+        warnings.append("UEFI on an MBR disk works on most PCs, but GPT is safer (\"Use entire disk\").")
+    others = [p for p in keep if p.get("fs") in ("ntfs", "bitlocker", "exfat") or
+              "microsoft" in p.get("label", "").lower() or "windows" in p.get("label", "").lower()]
+    if others and mode != "erase":
+        warnings.append("Other partitions on this disk (%s) stay untouched. If one holds Windows, start it "
+                        "from your PC's boot menu (usually F12, F11 or Esc at power-on)."
+                        % ", ".join(p["path"].rsplit("/", 1)[-1] for p in others))
+
+
+def act(kind, text):
+    return {"kind": kind, "text": text}
+
+
+def with_gaps(segs, disk_size, pt):
+    out, cur = [], 0
+    end = disk_size
+    for s in sorted(segs, key=lambda s: s["start"]):
+        if s["start"] - cur >= MIN_FREE:
+            out.append({"kind": "free", "start": cur, "size": s["start"] - cur})
+        out.append(s)
+        cur = max(cur, s["start"] + s["size"])
+    if end - cur >= MIN_FREE:
+        out.append({"kind": "free", "start": cur, "size": end - cur})
+    return out
+
+
+# ----------------------------------------------------------------------------- commit
+
+def table_script(p, ss, dump):
+    """sfdisk input for the whole new table. Erase: a fresh label. Otherwise the current
+    table (sfdisk --dump keeps label-id and every partition's uuid/type/name/attrs as-is)
+    minus deleted entries plus the new ones, written in one go."""
+    if p["erase"]:
+        script = ["label: %s" % p["ptType"], "unit: sectors"]
+        if p["ptType"] == "gpt":
+            script.append("first-lba: %d" % (ALIGN // ss))
+    else:
+        script = []
+        for line in dump.splitlines():
+            m = re.match(r"^(\S+)\s*:\s*start=", line)
+            if m:
+                num = int(re.search(r"(\d+)$", m.group(1)).group(1))
+                if num in p["deletes"]:
+                    continue
+            elif line.startswith("last-lba:"):
+                continue   # let sfdisk recompute it for the current disk size
+            script.append(line)
+    for c in sorted(p["creates"], key=lambda c: c["start"]):
+        if p["ptType"] == "gpt":
+            t = T_BIOSGRUB if c["fs"] == "biosgrub" else gpt_type(c["mountPoint"], c["fs"])
+            name = {"vfat": "EFI System", "biosgrub": "BIOS boot", "swap": "swap"}.get(
+                c["fs"], "RedNext" if c["mountPoint"] == "/" else (c["mountPoint"] or "linux").strip("/"))
+            extra = ', name="%s"' % name
+        else:
+            t = mbr_type(c["mountPoint"], c["fs"])
+            extra = ", bootable" if (c["mountPoint"] == "/" and p["firmware"] == "bios") else ""
+        script.append("%s : start=%d, size=%d, type=%s%s" % (c["path"], c["start"] // ss, c["size"] // ss, t, extra))
+    return "\n".join(script) + "\n"
+
+
+def commit(req, root, dry):
+    state = probe()
+    p = plan(state, req)
+    if not p["ok"]:
+        raise PlanError("The plan is not valid any more:\n" + "\n".join(p["errors"]))
+    if req.get("fingerprint") and req["fingerprint"] != p["fingerprint"]:
+        raise PlanError("The disk %s changed since the plan was made. Go back and check the "
+                        "Disk page again." % p["disk"])
+    d = find_disk(state, p["disk"])
+    ss = d["sectorSize"]
+
+    def x(cmd, **kw):
+        if dry:
+            log("DRY: " + " ".join(cmd) + (("  <<< " + kw["input_"].replace("\n", "\\n")) if kw.get("input_") else ""))
+            return None
+        return run(cmd, **kw)
+
+    log("== rednext-disk commit: %s %s (%s)" % (p["mode"], p["disk"], d["model"]))
+    for a in p["actions"]:
+        log("   - " + a["text"])
+
+    # 1. release what is about to be destroyed (automounts, swap) - Blivet teardown
+    victims = list(d["partitions"]) if p["erase"] else \
+        [q for q in d["partitions"] if q["number"] in p["deletes"]] + \
+        [q for q in d["partitions"] if any(m["number"] == q["number"] and not m["new"] and m["format"]
+                                            for m in p["mounts"])]
+    for q in victims:
+        for mp in q.get("mounted", []):
+            if mp == "[SWAP]":
+                x(["swapoff", q["path"]])
+            elif mp.startswith(("/run/media/", "/media/")):
+                x(["umount", q["path"]])
+            else:
+                raise PlanError("%s is mounted at %s; can't change it." % (q["path"], mp))
+
+    # 2. destroy formats, then destroy/create partitions in one table write
+    for q in victims:
+        if not q.get("extended"):
+            x(["wipefs", "-a", "-q", q["path"]])
+    if p["erase"]:
+        x(["wipefs", "-a", "-q", d["path"]])
+        dump = ""
+    else:
+        dump = run(["sfdisk", "--dump", d["path"]]).stdout if not dry else "label: %s\n" % p["ptType"]
+    script = table_script(p, ss, dump)
+    x(["sfdisk", "--no-reread", "--no-tell-kernel", "--wipe", "always" if p["erase"] else "never",
+       "--wipe-partitions", "never", d["path"]], input_=script)
+
+    # 3. make the kernel see the new table, then verify every new partition (Blivet _post_create)
+    if not dry:
+        if run(["blockdev", "--rereadpt", d["path"]], check=False).returncode != 0:
+            run(["partx", "-u", d["path"]], check=False)
+            for c in p["creates"]:
+                run(["partx", "-a", "--nr", str(c["number"]), d["path"]], check=False)
+        run(["udevadm", "settle", "--timeout=30"], check=False)
+        for c in p["creates"]:
+            wait_partition(c, ss)
+
+    # 4. wipe stale signatures on new partitions, then create formats
+    formats = [m for m in p["mounts"] if m["format"]]
+    for m in formats:
+        x(["wipefs", "-a", "-q", m["path"]])
+        label = FS_LABEL.get(m["mountPoint"] or "")
+        if m["fs"] == "vfat":
+            x(["mkfs.fat", "-F", "32", "-n", label or "EFI", m["path"]])
+        elif m["fs"] == "swap":
+            x(["mkswap", "-L", "swap", m["path"]])
+        elif m["fs"] == "ext4":
+            x(["mkfs.ext4", "-F", "-q", "-L", (label or "data")[:16], m["path"]])
+        elif m["fs"] == "btrfs":
+            x(["mkfs.btrfs", "-f", "-L", label or "data", m["path"]])
+        elif m["fs"] == "xfs":
+            x(["mkfs.xfs", "-f", "-L", (label or "data")[:12], m["path"]])
+        else:
+            raise PlanError("Don't know how to format %s as %s." % (m["path"], m["fs"]))
+    if not dry:
+        run(["udevadm", "settle", "--timeout=30"], check=False)
+
+    # 5. mount, / first then by depth (Blivet FSSet.mount_filesystems)
+    out, options = [], []
+    order = sorted([m for m in p["mounts"] if m["mountPoint"]],
+                   key=lambda m: (m["mountPoint"] == "swap", m["mountPoint"].count("/"), m["mountPoint"]))
+    if not dry:
+        os.makedirs(root, exist_ok=True)
+    for m in order:
+        info = blkinfo(m["path"]) if not dry else {"UUID": "dry-uuid", "PARTUUID": "dry-partuuid", "TYPE": m["fs"]}
+        fs = info.get("TYPE") or m["fs"]
+        if m["mountPoint"] != "swap":
+            target = root + (m["mountPoint"] if m["mountPoint"] != "/" else "")
+            opts = "umask=0077" if fs == "vfat" else "defaults"
+            if not dry:
+                os.makedirs(target, exist_ok=True)
+            x(["mount", "-t", fs, "-o", opts, m["path"], target])
+            options.append({"mountpoint": m["mountPoint"], "option_string": opts})
+            if not dry and run(["findmnt", "-n", "-o", "SOURCE", "--mountpoint", target], check=False).returncode != 0:
+                raise PlanError("%s did not mount on %s." % (m["path"], target))
+        out.append({
+            "device": m["path"], "mountPoint": m["mountPoint"] if m["mountPoint"] != "swap" else "",
+            "fs": {"vfat": "fat32", "swap": "linuxswap"}.get(fs, fs),
+            "fsName": {"vfat": "fat32", "swap": "linuxswap"}.get(fs, fs),
+            "uuid": info.get("UUID", ""), "partuuid": info.get("PARTUUID", ""),
+            "claimed": True, "features": {}, "partattrs": 0, "parttype": "",
+            "partlabel": "", "disk": d["path"],
+        })
+
+    # 6. the API file systems the chrooted steps need (Calamares mount.conf extraMounts)
+    extra = [{"device": "proc", "fs": "proc", "mountPoint": "/proc"},
+             {"device": "sys", "fs": "sysfs", "mountPoint": "/sys"},
+             {"device": "/dev", "mountPoint": "/dev", "options": "bind"},
+             {"device": "tmpfs", "fs": "tmpfs", "mountPoint": "/run"},
+             {"device": "/run/udev", "mountPoint": "/run/udev", "options": "bind"}]
+    if p["firmware"] == "efi":
+        extra.append({"device": "efivarfs", "fs": "efivarfs", "mountPoint": "/sys/firmware/efi/efivars"})
+    for e in extra:
+        target = root + e["mountPoint"]
+        if not dry:
+            os.makedirs(target, exist_ok=True)
+        if e.get("options") == "bind":
+            x(["mount", "--bind", e["device"], target])
+        else:
+            x(["mount", "-t", e["fs"], e["device"], target])
+    return {"ok": True, "rootMountPoint": root, "partitions": out, "firmware": p["firmware"],
+            "mountOptionsList": options, "extraMounts": extra,
+            "disk": d["path"], "swap": p["swap"], "summary": [a["text"] for a in p["actions"]]}
+
+
+def wait_partition(c, ss):
+    name = os.path.basename(c["path"])
+    for _ in range(60):
+        start = read_sys("/sys/class/block/%s/start" % name)
+        size = read_sys("/sys/class/block/%s/size" % name)
+        if start and size and os.path.exists(c["path"]):
+            if int(start) * 512 != c["start"] or int(size) * 512 != c["size"]:
+                raise PlanError("%s came up with a different size than planned "
+                                "(start %s, size %s sectors)." % (c["path"], start, size))
+            return
+        time.sleep(0.25)
+    raise PlanError("%s did not appear after writing the partition table." % c["path"])
+
+
+def blkinfo(path):
+    run(["udevadm", "settle", "--timeout=10"], check=False)
+    p = run(["blkid", "-p", "-o", "export", path], check=False)
+    info = {}
+    for line in (p.stdout or "").splitlines():
+        k, _, v = line.partition("=")
+        info[k] = v
+    q = run(["blkid", "-o", "export", path], check=False)   # PARTUUID comes from the cache path
+    for line in (q.stdout or "").splitlines():
+        k, _, v = line.partition("=")
+        info.setdefault(k, v)
+    return info
+
+
+# ----------------------------------------------------------------------------- main
+
+def load_req(arg):
+    data = sys.stdin.read() if arg == "-" else open(arg).read()
+    return json.loads(data)
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd = argv[1]
+    try:
+        if cmd == "probe":
+            res = probe()
+        elif cmd == "plan":
+            res = plan(probe(), load_req(argv[2] if len(argv) > 2 else "-"))
+        elif cmd == "commit":
+            args = argv[2:]
+            dry = "--dry-run" in args
+            args = [a for a in args if a != "--dry-run"]
+            root = args[args.index("--root") + 1] if "--root" in args else "/tmp/rednext-target"
+            if not dry and os.geteuid() != 0:
+                raise PlanError("commit must run as root")
+            res = commit(load_req(args[0]), root, dry)
+        else:
+            raise PlanError("unknown command %s" % cmd)
+    except PlanError as e:
+        res = {"ok": False, "errors": [str(e)], "fatal": True}
+        print(json.dumps(res, indent=1))
+        return 2
+    print(json.dumps(res, indent=1))
+    return 0 if res.get("ok", True) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -20,7 +20,7 @@ Rectangle {
     function iconFor(name, index) {
         var n = name.toLowerCase()
         var map = [ ["welcome", "waving_hand"], ["location", "public"], ["keyboard", "keyboard"],
-                    ["partition", "hard_drive"], ["user", "person"], ["app", "apps"],
+                    ["partition", "hard_drive"], ["disk", "hard_drive"], ["user", "person"], ["app", "apps"],
                     ["summary", "checklist"], ["install", "download"], ["set up", "download"],
                     ["finish", "celebration"] ]
         for (var i = 0; i < map.length; i++)

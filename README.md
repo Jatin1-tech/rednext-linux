@@ -61,7 +61,9 @@ Boots straight into a full desktop, so you can try everything before you touch y
 
 ### 🧭 A graphical installer
 A custom-built [Calamares](https://calamares.io/) with RedNext branding. Language, timezone,
-keyboard, partitioning, your account, optional apps, done.
+keyboard, disk, your account, optional apps, done. The **Disk** page is RedNext's own: pick a
+disk tile, choose *entire disk*, *free space* or *custom*, and see the exact result to scale before
+anything is written.
 
 ### 📦 Optional apps, your choice
 Tick **Blender**, **Spotify**, **IntelliJ IDEA**, **PyCharm** or **Rider** during install and they're
@@ -82,7 +84,8 @@ The root account is locked and your user gets `sudo`. No telemetry is enabled.
 
 | | |
 |:---:|:---:|
-| <img src="assets/screenshots/01-welcome.png" width="100%"><br><sub>**Welcome**: requirements check and language</sub> | <img src="assets/screenshots/04-users.png" width="100%"><br><sub>**Your account**: live checklist and password strength</sub> |
+| <img src="assets/screenshots/01-welcome.png" width="100%"><br><sub>**Welcome**: requirements check and language</sub> | <img src="assets/screenshots/08-disk.png" width="100%"><br><sub>**Disk**: next to Windows, sizes shown to scale</sub> |
+| <img src="assets/screenshots/09-disk-custom.png" width="100%"><br><sub>**Disk → Custom**: a job for every partition</sub> | <img src="assets/screenshots/04-users.png" width="100%"><br><sub>**Your account**: live checklist and password strength</sub> |
 | <img src="assets/screenshots/05-apps.png" width="100%"><br><sub>**Extra apps**: downloaded from official sources</sub> | <img src="assets/screenshots/06-summary.png" width="100%"><br><sub>**Summary**: nothing touches the disk before this</sub> |
 | <img src="assets/screenshots/02-location.png" width="100%"><br><sub>**Location**: timezone and locale</sub> | <img src="assets/screenshots/07-finished.png" width="100%"><br><sub>**Done**: restart into your new system</sub> |
 
@@ -99,20 +102,20 @@ that you join back together:
 
 | File | Size |
 |---|---|
-| `rednext-live-20261004.iso.part-aa` | 1.4 GB |
-| `rednext-live-20261004.iso.part-ab` | 1.2 GB |
+| `rednext-live-20261005.iso.part-aa` | 1.4 GB |
+| `rednext-live-20261005.iso.part-ab` | 1.2 GB |
 | `SHA256SUMS` | checksums for both parts and the joined ISO |
 
 ### Join the parts
 
 **Linux / macOS**
 ```bash
-cat rednext-live-20261004.iso.part-aa rednext-live-20261004.iso.part-ab > rednext-live-20261004.iso
+cat rednext-live-20261005.iso.part-aa rednext-live-20261005.iso.part-ab > rednext-live-20261005.iso
 ```
 
 **Windows** (Command Prompt, in the download folder)
 ```bat
-copy /b rednext-live-20261004.iso.part-aa + rednext-live-20261004.iso.part-ab rednext-live-20261004.iso
+copy /b rednext-live-20261005.iso.part-aa + rednext-live-20261005.iso.part-ab rednext-live-20261005.iso
 ```
 
 ---
@@ -122,7 +125,7 @@ copy /b rednext-live-20261004.iso.part-aa + rednext-live-20261004.iso.part-ab re
 Always check the ISO before writing it to a USB stick. The SHA-256 of the joined ISO must be:
 
 ```
-40c9e0710287206a4a29cda7aaec598d1e37a6b626ab09b35ff0932809e78de8  rednext-live-20261004.iso
+40c9e0710287206a4a29cda7aaec598d1e37a6b626ab09b35ff0932809e78de8  rednext-live-20261005.iso
 ```
 
 **Linux**: checks both parts *and* the joined ISO in one go:
@@ -137,7 +140,7 @@ shasum -a 256 -c SHA256SUMS
 
 **Windows** (PowerShell)
 ```powershell
-Get-FileHash .\rednext-live-20261004.iso -Algorithm SHA256
+Get-FileHash .\rednext-live-20261005.iso -Algorithm SHA256
 ```
 
 Every line must say `OK` (or the hash must match exactly). If it doesn't, download again.
@@ -167,7 +170,7 @@ Every line must say `OK` (or the hash must match exactly). If it doesn't, downlo
 
 **Linux**: find the stick with `lsblk`, then (replace `/dev/sdX`):
 ```bash
-sudo dd if=rednext-live-20261004.iso of=/dev/sdX bs=4M conv=fsync oflag=direct status=progress
+sudo dd if=rednext-live-20261005.iso of=/dev/sdX bs=4M conv=fsync oflag=direct status=progress
 sync
 ```
 
@@ -185,7 +188,7 @@ sync
 4. **Start the installer:**
    - **Hyprland**: it opens automatically. Press <kbd>Super</kbd> + <kbd>I</kbd> to open it again.
    - **Plasma**: double-click **Install RedNext** on the desktop, or find it in the app menu.
-5. **Follow the steps:** Welcome → Location → Keyboard → Partitions → Users → Extra apps → Summary → Install.
+5. **Follow the steps:** Welcome → Location → Keyboard → Disk → Users → Extra apps → Summary → Install.
 6. **Restart**, remove the USB stick, and log in with the account you created.
 
 The installer copies the live system to disk, creates your account (with `sudo`), installs GRUB for
@@ -195,11 +198,19 @@ belongs to the live session.
 <details>
 <summary><b>What does the installer change on my disk?</b></summary>
 
-- Only the disk/partitions you choose on the **Partitions** page. "Erase disk" wipes the selected disk;
-  "Manual partitioning" lets you pick existing partitions.
-- An **EFI system partition** (512 MB, FAT32) is created or reused on UEFI machines.
-- The root filesystem is **ext4** by default (**btrfs** also available).
-- Nothing is written before you confirm on the **Summary** page.
+- Only what you choose on the **Disk** page, which lists every step before you continue:
+  - **Use entire disk** erases the disk (you have to switch on *Erase it* first) and creates
+    GPT + a 1 GiB EFI partition + `/` on UEFI PCs, or MBR + `/` on BIOS PCs.
+  - **Use free space** keeps every existing partition untouched (Windows included) and puts RedNext
+    in the free space, with a size slider. An existing EFI partition is shared, not formatted.
+  - **Custom** lets you give each partition a job (`/`, `/boot/efi`, `/home`, swap…), format or
+    keep it, delete partitions and add new ones.
+- The live USB you booted from is never offered as a target.
+- The root filesystem is **ext4**. RedNext needs at least 20 GiB (40 GiB recommended).
+- Nothing is written before you confirm on the **Summary** page. At install time the disk is
+  re-checked and the install stops with a clear message if it changed.
+- Shrinking an existing partition isn't supported yet: make free space first (e.g. with Windows
+  Disk Management).
 
 </details>
 
@@ -271,7 +282,7 @@ and an **X11** session.
 | Hyprland / Quickshell | 0.56.2 / 0.3.1 |
 | Login manager | SDDM (Astronaut theme with video + sound) |
 | Boot | GRUB 2.14 (BIOS + UEFI), Plymouth |
-| Installer | Calamares 3.3.14 + kpmcore 26.08 (RedNext build) |
+| Installer | Calamares 3.3.14 (RedNext build) + RedNext disk engine |
 | Shells | fish 4.4 (default), bash |
 | Python | 3.14 |
 
@@ -296,9 +307,10 @@ rednext-linux/
 │   ├── scrub-paths.py            # removes build-user paths from binaries in the image
 │   ├── mkconfig.sh               # generates the generic ISO kernel config
 │   └── config-rednext-generic    # the kernel config used for this release
+├── installer/rednextdisk/        # Calamares page module for the Disk step (C++, built in-tree)
 ├── calamares/                    # installed into the live image as-is
 │   ├── etc/calamares/            # settings, module configs, RedNext branding (QML + QSS)
-│   └── usr/…                     # launcher, target-prep script, optional-app installer
+│   └── usr/…                     # launcher, disk engine (rednext-disk), target prep, optional apps
 ├── assets/                       # logo, banner, screenshots
 └── SHA256SUMS
 ```
