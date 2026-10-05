@@ -79,6 +79,12 @@ step_calamares() {
   patch -p1 < "$here/calamares-qml-focus.patch"
   # RedNext's own disk page (QML + rednext-disk engine) replaces the kpmcore partition module
   cp -r "$here/../installer/rednextdisk" src/modules/
+  # unpackfs/bootloader declare the skipped partition/mount modules as dependencies, which makes
+  # Calamares stop with "initialization failed"; rednextdisk sets the same globals they read
+  sed -i 's/^requiredModules: \[ mount \]/requiredModules: [ rednextdisk ]/' src/modules/unpackfs/module.desc
+  sed -i 's/^requiredModules: \[ "partition" \]/requiredModules: [ "rednextdisk" ]/' src/modules/bootloader/module.desc
+  ! grep -qE 'requiredModules:.*(mount|partition)' src/modules/{unpackfs,bootloader}/module.desc ||
+    { echo "module.desc deps not patched" >&2; exit 1; }
   cm -DYAMLCPP_DIR="$IS/usr" -DWITH_QT6=ON -DWITH_PYTHON=ON -DWITH_PYBIND11=ON -DINSTALL_CONFIG=OFF -DINSTALL_POLKIT=ON \
      -DWITH_APPSTREAM=OFF -DWITH_PYTHONQT=OFF \
      -DSKIP_MODULES="webview dracut dracutlukscfg initramfs initramfscfg initcpio initcpiocfg mkinitfs \
