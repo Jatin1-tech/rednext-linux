@@ -97,25 +97,25 @@ The root account is locked and your user gets `sudo`. No telemetry is enabled.
 
 Get the latest release from the **[Releases page](https://github.com/Jatin1-tech/rednext-linux/releases)**.
 
-The ISO is **2.6 GB**, more than GitHub's 2 GB limit per file, so it's published in **two parts**
+The ISO is **2.8 GB**, more than GitHub's 2 GB limit per file, so it's published in **two parts**
 that you join back together:
 
 | File | Size |
 |---|---|
-| `rednext-live-20261005.iso.part-aa` | 1.4 GB |
-| `rednext-live-20261005.iso.part-ab` | 1.2 GB |
+| `rednext-live-20261006.iso.part-aa` | 1.5 GB |
+| `rednext-live-20261006.iso.part-ab` | 1.4 GB |
 | `SHA256SUMS` | checksums for both parts and the joined ISO |
 
 ### Join the parts
 
 **Linux / macOS**
 ```bash
-cat rednext-live-20261005.iso.part-aa rednext-live-20261005.iso.part-ab > rednext-live-20261005.iso
+cat rednext-live-20261006.iso.part-aa rednext-live-20261006.iso.part-ab > rednext-live-20261006.iso
 ```
 
 **Windows** (Command Prompt, in the download folder)
 ```bat
-copy /b rednext-live-20261005.iso.part-aa + rednext-live-20261005.iso.part-ab rednext-live-20261005.iso
+copy /b rednext-live-20261006.iso.part-aa + rednext-live-20261006.iso.part-ab rednext-live-20261006.iso
 ```
 
 ---
@@ -125,7 +125,7 @@ copy /b rednext-live-20261005.iso.part-aa + rednext-live-20261005.iso.part-ab re
 Always check the ISO before writing it to a USB stick. The SHA-256 of the joined ISO must be:
 
 ```
-40c9e0710287206a4a29cda7aaec598d1e37a6b626ab09b35ff0932809e78de8  rednext-live-20261005.iso
+19af41227d8a5abd5220dd44594dc8d10abd0ccdfb5f3e9423cce70c0a9fdcfd  rednext-live-20261006.iso
 ```
 
 **Linux**: checks both parts *and* the joined ISO in one go:
@@ -140,7 +140,7 @@ shasum -a 256 -c SHA256SUMS
 
 **Windows** (PowerShell)
 ```powershell
-Get-FileHash .\rednext-live-20261005.iso -Algorithm SHA256
+Get-FileHash .\rednext-live-20261006.iso -Algorithm SHA256
 ```
 
 Every line must say `OK` (or the hash must match exactly). If it doesn't, download again.
@@ -170,7 +170,7 @@ Every line must say `OK` (or the hash must match exactly). If it doesn't, downlo
 
 **Linux**: find the stick with `lsblk`, then (replace `/dev/sdX`):
 ```bash
-sudo dd if=rednext-live-20261005.iso of=/dev/sdX bs=4M conv=fsync oflag=direct status=progress
+sudo dd if=rednext-live-20261006.iso of=/dev/sdX bs=4M conv=fsync oflag=direct status=progress
 sync
 ```
 
@@ -255,6 +255,7 @@ screen and session menu, all coloured from your wallpaper.
 | <kbd>Super</kbd> + <kbd>Alt</kbd> + <kbd>Space</kbd> | Toggle floating |
 | <kbd>Super</kbd> + <kbd>1</kbd>…<kbd>9</kbd> | Switch workspace |
 | <kbd>Super</kbd> + <kbd>Alt</kbd> + <kbd>1</kbd>…<kbd>9</kbd> | Move window to workspace |
+| <kbd>Super</kbd> + <kbd>/</kbd> | Live (video) wallpaper picker |
 | <kbd>Super</kbd> + <kbd>V</kbd> | Clipboard history |
 | <kbd>Super</kbd> + <kbd>.</kbd> | Emoji picker |
 | <kbd>Print</kbd> | Screenshot (full screen) |
@@ -285,6 +286,7 @@ and an **X11** session.
 | Installer | Calamares 3.3.14 (RedNext build) + RedNext disk engine |
 | Shells | fish 4.4 (default), bash |
 | Python | 3.14 |
+| Java | Temurin JDK 27 (`/opt/java`) |
 
 ---
 
