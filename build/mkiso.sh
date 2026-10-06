@@ -170,6 +170,18 @@ UNIT
   # 4 s intro a little more headroom than the installed system's 5.2 s
   sed -i 's#splash-min-time 5\.2#splash-min-time 6.0#' "$R/etc/systemd/system/plymouth-quit.service.d/rednext-min-time.conf"
 
+  say "GPU drivers before the splash (generic, not just the build host's amdgpu)"
+  # Plymouth must start on the real GPU, not simpledrm, or the KMS handoff blanks the animation.
+  # The host's wait-gpu.conf drop-in (plymouth-start After=systemd-modules-load) comes along with /etc.
+  rm -f "$R/etc/modules-load.d/amdgpu.conf"
+  printf '%s\n' '# RedNext: load the common GPU drivers early so Plymouth starts on the real GPU' \
+    '# (not simpledrm) and the KMS handoff does not blank the boot animation' amdgpu i915 \
+    > "$R/etc/modules-load.d/rednext-gpu.conf"
+  # one splash hold only: splash-min-time (rednext-min-time.conf) above; drop the host's duplicate
+  rm -f "$R/etc/systemd/system/plymouth-quit.service.d/min-time.conf" \
+        "$R/etc/systemd/system/plymouth-quit-wait.service.d/min-time.conf" "$R/usr/local/libexec/plymouth-min-time"
+  rmdir "$R/etc/systemd/system/plymouth-quit-wait.service.d" 2>/dev/null || true
+
   say "PATH: /usr/local/bin + /usr/sbin for every user"
   # /etc/profile sets PATH=/usr/bin; on the build host /usr/local/bin only came from the
   # user's fish universal variables, so the live session couldn't find Hyprland, qs, hyprctl...
@@ -240,6 +252,10 @@ P
   chk "privacy: no /home/$BU in any file (incl. binaries)" "! grep -rlsa --devices=skip -e '/home/$BU' $R/usr $R/opt $R/etc $R/var $R/home | tee /dev/stderr | grep -q ."
   [ ${#PW[@]} -gt 0 ] && chk "privacy: no PRIVATE_WORDS in any file" "! grep -rlsaI --devices=skip ${PW[*]} $R/usr $R/opt $R/etc $R/var $R/home | tee /dev/stderr | grep -q ."
   chk "privacy: no '$BU' word in text files" "! grep -rlswI --devices=skip --exclude-dir=dict -e '$BU' $R/usr $R/opt $R/etc $R/var $R/home $R/root | tee /dev/stderr | grep -q ."
+  chk "java in /opt/java, on PATH"   "chroot $R /usr/bin/bash -lc 'command -v java' | grep -q /opt/java"
+  chk "live wallpaper picker"        "[ -x $R/usr/bin/video-wallpaper-picker ] && grep -q '\"video-wallpaper toggle\"' $R/etc/skel/.config/hypr/hyprland/keybinds.lua"
+  chk "CrimsonCaelestia colours"     "[ -f $R/usr/share/color-schemes/CrimsonCaelestia.colors ]"
+  chk "GPU drivers before splash"    "grep -qx i915 $R/etc/modules-load.d/rednext-gpu.conf"
   chk "modules.dep"                  "[ -s $R/usr/lib/modules/$KVER/modules.dep ]"
   for m in sys proc dev; do umount "$R/$m"; done; trap - EXIT
   [ $ok = 1 ] || { echo "rootfs checks failed" >&2; exit 1; }

@@ -18,6 +18,12 @@ for c in hypr caelestia quickshell fish foot fuzzel btop cava fastfetch gtk-3.0 
 done
 find "$S" \( -name '*.bak' -o -name '*.bak[0-9]*' -o -name '*.bak-*' -o -name fish_variables -o -name '.git' \) -prune -exec rm -rf {} +
 rm -f "$S/.config/fish/conf.d/dotnet-certs.fish"
+rm -f "$S/.config/fish/conf.d/java.fish"              # per-user JDK path; the image ships /opt/java instead
+# Vim: crimson colour scheme + vimrc (only the theme, not undo/swap/viminfo)
+[ -f "$H/.vimrc" ] && cp -a "$H/.vimrc" "$S/"
+[ -d "$H/.vim/colors" ] && { mkdir -p "$S/.vim"; cp -a "$H/.vim/colors" "$S/.vim/"; }
+# Hyprland calls helpers from ~/.local/bin on the build host; in the image they live in /usr/bin
+sed -i 's#os.getenv("HOME") \.\. "/\.local/bin/#"#g' "$S"/.config/hypr/hyprland/*.lua
 rm -rf "$S/.config/caelestia/monitors"            # laptop-specific (eDP-1)
 mkdir -p "$S/.config/menus"
 ln -s /opt/kf6/etc/xdg/menus/plasma-applications.menu "$S/.config/menus/applications.menu"
@@ -59,7 +65,19 @@ for p in caelestia caelestia-*.dist-info materialyoucolor materialyoucolor-*.dis
 done
 # .pyc caches record the source path (/home/<user>/.local/lib/...); Python rebuilds them
 find "$O/usr/lib/$PY/site-packages" -name __pycache__ -prune -exec rm -rf {} +
-for b in caelestia caelestia-logout screenshot-popup video-wallpaper; do install -m755 "$H/.local/bin/$b" "$O/usr/bin/$b"; done
+for b in caelestia caelestia-logout screenshot-popup video-wallpaper video-wallpaper-picker; do install -m755 "$H/.local/bin/$b" "$O/usr/bin/$b"; done
+
+# KDE colour scheme used by kdeglobals/dolphinrc (CrimsonCaelestia)
+mkdir -p "$O/usr/share/color-schemes"
+cp -a "$H/.local/share/color-schemes/." "$O/usr/share/color-schemes/"
+
+# Java: the build user's Temurin JDK, system-wide in /opt/java (JAVA_HOME for bash + fish)
+JDK=$(readlink -f "$H/.local/share/java/current")
+mkdir -p "$O/opt/java" "$O/etc/profile.d" "$O/etc/fish/conf.d"
+cp -a "$JDK" "$O/opt/java/"
+ln -sfn "${JDK##*/}" "$O/opt/java/current"
+printf '%s\n' '# RedNext: Temurin OpenJDK' 'export JAVA_HOME=/opt/java/current' 'pathappend $JAVA_HOME/bin' > "$O/etc/profile.d/java.sh"
+printf '%s\n' '# RedNext: Temurin OpenJDK (same as /etc/profile.d/java.sh)' 'set -gx JAVA_HOME /opt/java/current' 'fish_add_path -gaP $JAVA_HOME/bin' > "$O/etc/fish/conf.d/java.fish"
 
 # Spotify tray-icon libraries: the installer copies them to /opt/spotify/deps when Spotify is
 # ticked (they're live-only in the image; scrub-paths.py in mkiso.sh clears their build paths)
