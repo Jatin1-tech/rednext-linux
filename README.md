@@ -8,7 +8,7 @@
 
 # RedNext Linux
 
-**A from-source Linux desktop, themed from boot to desktop.**
+**A from-source Linux desktop, themed from boot to desktop. Hope you Love it**
 
 [![Release](https://img.shields.io/github/v/release/Jatin1-tech/rednext-linux?include_prereleases&label=release&color=D42A3C&style=for-the-badge)](https://github.com/Jatin1-tech/rednext-linux/releases)
 [![Downloads](https://img.shields.io/github/downloads/Jatin1-tech/rednext-linux/total?color=D42A3C&style=for-the-badge)](https://github.com/Jatin1-tech/rednext-linux/releases)
